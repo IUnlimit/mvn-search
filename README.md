@@ -19,14 +19,17 @@ go build -o mvn-search .
 
 | 按键 | 行为 |
 |---|---|
-| 可打印字符 / Backspace | 编辑查询 |
-| `↑` `↓`（`Ctrl+P` `Ctrl+N`） | 移动选中 |
-| `PgUp` `PgDn` `Home` `End` | 翻页 / 首尾 |
+| 可打印字符 / Backspace | 编辑查询（`space` 输入空格） |
+| `↑` `↓`（`Ctrl+P` `Ctrl+N`） / `PgUp` `PgDn` `Home` `End` | 进入**操作视图**并移动选中 |
+| `Space`（操作视图） | 展开 / 收起当前包的版本列表 |
+| `Esc`（操作视图） | 退出操作视图（`space` 恢复为空格输入） |
+| `Esc`（输入视图） | 清空查询 |
 | `Enter` | 复制 **Maven** 依赖 XML |
 | `Ctrl+G` | 复制 **Gradle (Groovy)** 依赖 |
 | `Ctrl+R` | 重建索引缓存 |
-| `Esc` | 清空查询 |
 | `Ctrl+C` | 退出 |
+
+标题栏的 `INPUT` / `OPS` 标明当前模式；状态栏提示 `space types` / `space expand`。
 
 ### 命令行参数
 
@@ -64,6 +67,17 @@ implementation 'com.google.guava:guava:33.5.0-jre'
 ## 行为说明
 
 - **多关键字交集**：每个关键字须在 `groupId` / `artifactId` / `version` 任一处命中（大小写不敏感子串），全部关键字同时满足才入选。
+- **路径前缀树**：`groupId` 按 `.` 分段建树，子包自动挂在父路径下（如 `com.illtamer.plugin.*` 挂在 `com.illtamer.plugin` 下），再挂 `artifactId` / `version`。单链路径折叠为 `a.b.c`，单包折叠为 `group:artifact`。
+  ```
+  org.junit.jupiter  ·4  −
+  │  ├─ junit-jupiter  ·4  −
+  ▸ │  │  ├─ 5.12.2
+    │  │  └─ 5.10.0
+    │  └─ junit-jupiter-api  ·7  +
+    org.mockito:mockito-junit-jupiter  ·2  +
+  ```
+  默认：组展开显示包名、包收起隐藏版本；`Space` 在操作视图逐层收纳/展开（`·N` 数量，`+`/`−` 状态）。单包组会折叠为 `group:artifact`。空查询保持扁平 GAV。
+- **操作视图**：方向键进入；`Space` 收纳/展开；`Esc` 回到输入模式。
 - **排序**：artifactId 精确 > 前缀 > 包含 > groupId > version；同 GA 按版本号降序（数字段感知，`33.10` > `33.9`）。
 - **识别规则**：版本目录下存在 `{artifactId}-{version}.pom` 或主 jar（忽略 `-sources` / `-javadoc` 等 classifier 单独成条）；jar 与 pom 同 GAV 时合并为一条并优先标记 `jar`。
 
