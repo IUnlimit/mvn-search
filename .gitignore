@@ -1,0 +1,11 @@
+# build output
+/mvn-search
+
+# local plans / tooling
+.narrafork/
+
+# editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
