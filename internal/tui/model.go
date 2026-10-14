@@ -14,15 +14,26 @@ import (
 	"mvn-search/internal/maven"
 )
 
+// uiMode switches between typing into the query and operating the result tree.
+type uiMode int
+
+const (
+	modeInput uiMode = iota // space types a space into the query
+	modeOps                 // entered via move keys; space expands/collapses
+)
+
 // Model is the root Bubble Tea model for mvn-search.
 type Model struct {
 	styles Styles
 	input  textinput.Model
+	mode   uiMode
 
-	idx     *index.Index
-	results []maven.Artifact
-	cursor  int
-	offset  int
+	idx      *index.Index
+	results  []maven.Artifact
+	rows     []row
+	expanded expandState
+	cursor   int // index into rows (visible selection)
+	offset   int // first visible row index into rows
 
 	width  int
 	height int
@@ -43,9 +54,10 @@ func New(idx *index.Index) Model {
 	ti.SetWidth(48)
 
 	m := Model{
-		styles: NewStyles(true),
-		input:  ti,
-		idx:    idx,
+		styles:   NewStyles(true),
+		input:    ti,
+		idx:      idx,
+		expanded: expandState{},
 	}
 	m.refresh("")
 	return m
@@ -76,7 +88,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyPressMsg:
-		switch msg.String() {
+		key := msg.String()
+
+		switch key {
 		case "ctrl+c":
 			return m, tea.Quit
 
@@ -89,80 +103,139 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.idx = built
 			m.refresh(m.input.Value())
 			return m, setStatus(fmt.Sprintf("rebuilt · %d artifacts", len(built.Artifacts)), false)
-
-		case "esc":
-			m.input.SetValue("")
-			m.cursor = 0
-			m.offset = 0
-			m.refresh("")
-			return m, nil
-
-		case "up", "ctrl+p":
-			if m.cursor > 0 {
-				m.cursor--
-				m.clampView()
-			}
-			return m, nil
-
-		case "down", "ctrl+n":
-			if m.cursor+1 < len(m.results) {
-				m.cursor++
-				m.clampView()
-			}
-			return m, nil
-
-		case "pgup":
-			m.cursor -= m.pageSize()
-			if m.cursor < 0 {
-				m.cursor = 0
-			}
-			m.clampView()
-			return m, nil
-
-		case "pgdown":
-			m.cursor += m.pageSize()
-			if m.cursor >= len(m.results) {
-				m.cursor = len(m.results) - 1
-			}
-			if m.cursor < 0 {
-				m.cursor = 0
-			}
-			m.clampView()
-			return m, nil
-
-		case "home":
-			m.cursor = 0
-			m.clampView()
-			return m, nil
-
-		case "end":
-			m.cursor = len(m.results) - 1
-			if m.cursor < 0 {
-				m.cursor = 0
-			}
-			m.clampView()
-			return m, nil
-
-		case "enter":
-			if a, ok := m.selected(); ok {
-				return m, tea.Batch(
-					tea.SetClipboard(a.FormatMaven()),
-					setStatus("copied maven", false),
-				)
-			}
-			return m, nil
-
-		case "ctrl+g":
-			if a, ok := m.selected(); ok {
-				return m, tea.Batch(
-					tea.SetClipboard(a.FormatGradle()),
-					setStatus("copied gradle", false),
-				)
-			}
-			return m, nil
 		}
 
-		// typing: feed textinput, then re-run search
+		// --- operation view mode ---
+		if m.mode == modeOps {
+			switch key {
+			case "esc":
+				m.mode = modeInput
+				m.input.Focus()
+				return m, textinput.Blink
+
+			case " ", "space":
+				m.doToggleExpand()
+				return m, nil
+
+			case "up", "ctrl+p":
+				m.moveCursor(-1)
+				return m, nil
+
+			case "down", "ctrl+n":
+				m.moveCursor(1)
+				return m, nil
+
+			case "pgup":
+				m.moveCursor(-m.pageSize())
+				return m, nil
+
+			case "pgdown":
+				m.moveCursor(m.pageSize())
+				return m, nil
+
+			case "home":
+				if sel := m.visibleSelectable(); len(sel) > 0 {
+					m.cursor = sel[0]
+				}
+				m.clampView()
+				return m, nil
+
+			case "end":
+				if sel := m.visibleSelectable(); len(sel) > 0 {
+					m.cursor = sel[len(sel)-1]
+				}
+				m.clampView()
+				return m, nil
+
+			case "enter":
+				if a, ok := m.selected(); ok {
+					return m, tea.Batch(
+						tea.SetClipboard(a.FormatMaven()),
+						setStatus("copied maven", false),
+					)
+				}
+				return m, nil
+
+			case "ctrl+g":
+				if a, ok := m.selected(); ok {
+					return m, tea.Batch(
+						tea.SetClipboard(a.FormatGradle()),
+						setStatus("copied gradle", false),
+					)
+				}
+				return m, nil
+
+			case "backspace":
+				m.mode = modeInput
+				m.input.Focus()
+				// fall through to textinput
+			default:
+				// printable / other editing keys return to input mode
+				if len(key) == 1 {
+					m.mode = modeInput
+					m.input.Focus()
+				} else {
+					return m, nil
+				}
+			}
+		} else {
+			// --- input mode: move keys enter ops mode ---
+			switch key {
+			case "up", "ctrl+p", "down", "ctrl+n", "pgup", "pgdown", "home", "end":
+				m.mode = modeOps
+				m.input.Blur()
+				// apply the navigation immediately
+				switch key {
+				case "up", "ctrl+p":
+					m.moveCursor(-1)
+				case "down", "ctrl+n":
+					m.moveCursor(1)
+				case "pgup":
+					m.moveCursor(-m.pageSize())
+				case "pgdown":
+					m.moveCursor(m.pageSize())
+				case "home":
+					if sel := m.visibleSelectable(); len(sel) > 0 {
+						m.cursor = sel[0]
+					}
+					m.clampView()
+				case "end":
+					if sel := m.visibleSelectable(); len(sel) > 0 {
+						m.cursor = sel[len(sel)-1]
+					}
+					m.clampView()
+				}
+				return m, nil
+
+			case "esc":
+				m.input.SetValue("")
+				m.cursor = 0
+				m.offset = 0
+				m.expanded = expandState{}
+				m.refresh("")
+				return m, nil
+
+			case "enter":
+				if a, ok := m.selected(); ok {
+					return m, tea.Batch(
+						tea.SetClipboard(a.FormatMaven()),
+						setStatus("copied maven", false),
+					)
+				}
+				return m, nil
+
+			case "ctrl+g":
+				if a, ok := m.selected(); ok {
+					return m, tea.Batch(
+						tea.SetClipboard(a.FormatGradle()),
+						setStatus("copied gradle", false),
+					)
+				}
+				return m, nil
+			}
+		}
+
+		// typing: feed textinput, re-run search (reset expansion)
 		var cmd tea.Cmd
 		m.input, cmd = m.input.Update(msg)
 		m.refresh(m.input.Value())
@@ -193,71 +266,91 @@ func (m Model) render() string {
 		height = 24
 	}
 
-	// header
 	repo := m.idx.Repo
 	if home, err := homeRel(repo); err == nil {
 		repo = home
 	}
+	modeTag := "INPUT"
+	if m.mode == modeOps {
+		modeTag = "OPS"
+	}
 	header := s.Title.Render("mvn-search") +
 		"  " + s.Subtitle.Render(repo) +
-		"  " + s.Count.Render(fmt.Sprintf("%d deps", len(m.idx.Artifacts)))
+		"  " + s.Count.Render(fmt.Sprintf("%d deps", len(m.idx.Artifacts))) +
+		"  " + s.Label.Render(modeTag)
 
 	queryLine := s.Query.Render(m.input.View()) +
 		"  " + s.Count.Render(fmt.Sprintf("%d hits", len(m.results)))
 
 	sep := s.Border.Render(strings.Repeat("─", max(8, width-2)))
 
-	// list region
-	listH := m.pageSize()
+	detail := m.renderDetail(width)
+	status := m.renderStatus()
+	help := s.Help.Render("↑↓/PgUp/Dn  Esc leaves ops  Space expand  Enter maven  Ctrl+G gradle  Ctrl+R rebuild  Ctrl+C quit")
+
+	listH := m.listHeight(width)
 	list := m.renderList(listH, width)
 
-	// detail panel
-	detail := m.renderDetail(width)
-
-	// footer / status
-	status := m.renderStatus()
-	help := s.Help.Render("↑↓ move  Enter maven  Ctrl+G gradle  Ctrl+R rebuild  Esc clear  Ctrl+C quit")
-
-	parts := []string{header, queryLine, sep, list, detail, status, help}
-	body := strings.Join(parts, "\n")
-
-	// trim list if content exceeds terminal height
-	lines := strings.Split(body, "\n")
-	if maxLines := height; len(lines) > maxLines {
-		// keep header (3) + as many list lines as fit + detail + footer
-		// simply cut from the end of list section by regenerating with smaller list
-		extra := len(lines) - maxLines
-		trimmed := m.renderList(max(1, listH-extra), width)
-		body = strings.Join([]string{header, queryLine, sep, trimmed, detail, status, help}, "\n")
-		lines = strings.Split(body, "\n")
-		if len(lines) > maxLines {
-			lines = lines[:maxLines]
-			body = strings.Join(lines, "\n")
-		}
+	body := strings.Join([]string{header, queryLine, sep, list, detail, status, help}, "\n")
+	if lines := strings.Split(body, "\n"); len(lines) > height {
+		lines = lines[:height]
+		body = strings.Join(lines, "\n")
 	}
 	return body
+}
+
+// listHeight is the number of result rows that fit between chrome and the bottom.
+func (m Model) listHeight(width int) int {
+	if width <= 0 {
+		width = m.width
+	}
+	if width <= 0 {
+		width = 80
+	}
+	height := m.height
+	if height <= 0 {
+		height = 24
+	}
+	detail := m.renderDetail(width)
+	status := m.renderStatus()
+	chrome := 4 + lipgloss.Height(detail) + lipgloss.Height(status) + 1
+	h := height - chrome
+	if h < 1 {
+		h = 1
+	}
+	return h
+}
+
+func (m Model) pageSize() int {
+	return m.listHeight(m.width)
 }
 
 func (m Model) renderList(height, width int) string {
 	if height <= 0 {
 		height = 1
 	}
-	if len(m.results) == 0 {
+	if len(m.rows) == 0 {
 		return m.styles.Status.Render("  no matches")
 	}
 
 	var b strings.Builder
 	for i := 0; i < height; i++ {
-		row := m.offset + i
-		if row >= len(m.results) {
+		ri := m.offset + i
+		if ri >= len(m.rows) {
 			break
 		}
-		a := m.results[row]
-		line := formatRow(a, max(10, width-4), row == m.cursor)
-		if row == m.cursor {
+		r := m.rows[ri]
+		sel := ri == m.cursor
+		line := formatRow(r, max(10, width-4), sel, m.styles)
+		switch {
+		case sel:
 			b.WriteString(m.styles.Selected.Width(max(10, width-2)).Render(line))
-		} else {
-			b.WriteString(m.styles.Normal.Width(max(10, width-2)).Render(line))
+		case r.kind == rowGroup:
+			b.WriteString(m.styles.Normal.Width(max(10, width-2)).Render(m.styles.Label.Render(line)))
+		case r.kind == rowPackage:
+			b.WriteString(m.styles.Normal.Width(max(10, width-2)).Render(m.styles.Group.Render(line)))
+		default:
+			b.WriteString(m.styles.Normal.Width(max(10, width-2)).Render(m.styles.Version.Render(line)))
 		}
 		if i < height-1 {
 			b.WriteByte('\n')
@@ -266,21 +359,34 @@ func (m Model) renderList(height, width int) string {
 	return b.String()
 }
 
-func formatRow(a maven.Artifact, width int, selected bool) string {
-	prefix := "  "
+func formatRow(r row, width int, selected bool, s Styles) string {
+	marker := "  "
 	if selected {
-		prefix = "▸ "
+		marker = "▸ "
 	}
-	ga := a.GAV()
-	// truncate from the left if needed (keep version visible)
-	maxGA := width - lipgloss.Width(prefix)
-	if lipgloss.Width(ga) > maxGA {
-		r := []rune(ga)
-		if len(r) > maxGA {
-			ga = "…" + string(r[len(r)-maxGA+1:])
+	text := r.text
+	if r.kind == rowGroup || r.kind == rowPackage {
+		text += "  " + summaryCount(r.childCnt)
+		if r.expanded {
+			text += "  −"
+		} else if r.childCnt > 0 {
+			text += "  +"
 		}
 	}
-	return prefix + ga
+	line := marker + r.branch + text
+	if r.kind == rowLeaf && r.depth == 0 {
+		// flat GAV dump: left-truncate so the version stays visible
+		maxGA := width - lipgloss.Width(marker)
+		ga := r.text
+		if lipgloss.Width(ga) > maxGA {
+			runes := []rune(ga)
+			if len(runes) > maxGA {
+				ga = "…" + string(runes[len(runes)-maxGA+1:])
+			}
+		}
+		line = marker + ga
+	}
+	return line
 }
 
 func (m Model) renderDetail(width int) string {
@@ -324,60 +430,152 @@ func (m Model) renderStatus() string {
 	} else if m.status != "" {
 		st = s.StatusOK
 	}
-	return st.Render("  " + text)
+	modeHint := "space types"
+	if m.mode == modeOps {
+		modeHint = "space expand"
+	}
+	return st.Render("  " + text + "  ·  " + modeHint)
 }
 
 func (m Model) selected() (maven.Artifact, bool) {
-	if m.cursor < 0 || m.cursor >= len(m.results) {
+	if m.cursor < 0 || m.cursor >= len(m.rows) {
 		return maven.Artifact{}, false
 	}
-	return m.results[m.cursor], true
+	i := m.rows[m.cursor].leafIdx
+	if i < 0 || i >= len(m.results) {
+		return maven.Artifact{}, false
+	}
+	return m.results[i], true
 }
 
-func (m Model) pageSize() int {
-	// header(1)+query(1)+sep(1)+detail(~8)+status(1)+help(1) + some margin
-	const chrome = 14
-	h := m.height - chrome
-	if h < 3 {
-		h = 3
+// visibleSelectable returns row indices in order (all visible rows are navigable).
+func (m Model) visibleSelectable() []int {
+	out := make([]int, len(m.rows))
+	for i := range m.rows {
+		out[i] = i
 	}
-	if h > 30 {
-		h = 30
+	return out
+}
+
+// moveCursor moves by delta visible rows.
+func (m *Model) moveCursor(delta int) {
+	if len(m.rows) == 0 {
+		return
 	}
-	return h
+	m.cursor += delta
+	m.clampView()
+}
+
+// doToggleExpand folds/unfolds the group or package under the cursor.
+func (m *Model) doToggleExpand() {
+	if m.cursor < 0 || m.cursor >= len(m.rows) {
+		return
+	}
+	cur := m.rows[m.cursor]
+	key := cur.key
+	if key == "" || cur.kind == rowLeaf {
+		// toggling a version leaf targets its parent package
+		key = cur.parent
+		if key == "" {
+			return
+		}
+	}
+	next := !cur.expanded
+	if cur.kind == rowLeaf {
+		// parent may be closed in state map; flip it
+		if m.expanded[key] {
+			next = false
+		} else {
+			next = true
+		}
+	}
+	m.expanded[key] = next
+
+	prevKey := cur.key
+	prevLeaf := cur.leafIdx
+	m.rows = buildRowsWithQuery(m.results, m.input.Value(), m.expanded)
+
+	// Restore cursor: same key if still visible, else same leaf, else first child.
+	m.cursor = 0
+	for i, r := range m.rows {
+		if r.key == prevKey {
+			m.cursor = i
+			break
+		}
+	}
+	for i, r := range m.rows {
+		if r.leafIdx == prevLeaf && r.kind == rowLeaf {
+			m.cursor = i
+			break
+		}
+	}
+	m.clampView()
+}
+
+func (m *Model) clampView() {
+	if len(m.rows) == 0 {
+		m.cursor = 0
+		m.offset = 0
+		return
+	}
+	if m.cursor < 0 {
+		m.cursor = 0
+	}
+	if m.cursor >= len(m.rows) {
+		m.cursor = len(m.rows) - 1
+	}
+	h := m.pageSize()
+	ri := m.cursor
+
+	// When the selection sits in the first page, pin the top so row 0 stays
+	// visible (fixes "cannot scroll back to the first line").
+	if ri < h {
+		m.offset = 0
+		return
+	}
+	if m.offset > ri {
+		m.offset = ri
+	}
+	if m.offset+h <= ri {
+		m.offset = ri - h + 1
+	}
+	if m.offset < 0 {
+		m.offset = 0
+	}
+	if m.offset > len(m.rows)-1 {
+		m.offset = max(0, len(m.rows)-1)
+	}
 }
 
 func (m *Model) refresh(query string) {
 	if m.idx == nil {
 		m.results = nil
+		m.rows = nil
 		return
 	}
 	m.results = index.Search(m.idx.Artifacts, query)
-	if m.cursor >= len(m.results) {
-		m.cursor = len(m.results) - 1
+	// Drop expansion for keys that no longer appear in the new rows.
+	next := expandState{}
+	touched := buildRowsWithQuery(m.results, query, nil)
+	seen := make(map[string]bool, len(touched))
+	// rebuild with previous expansion, then prune unknown keys
+	m.rows = buildRowsWithQuery(m.results, query, m.expanded)
+	for _, r := range m.rows {
+		seen[r.key] = true
+		if r.kind == rowLeaf {
+			seen[r.parent] = true
+		}
 	}
-	if m.cursor < 0 {
-		m.cursor = 0
+	for k, v := range m.expanded {
+		if seen[k] {
+			next[k] = v
+		}
 	}
-}
-
-func (m *Model) clampView() {
-	if m.cursor < 0 {
-		m.cursor = 0
-	}
-	if n := len(m.results); n > 0 && m.cursor >= n {
-		m.cursor = n - 1
-	}
-	h := m.pageSize()
-	if m.offset > m.cursor {
-		m.offset = m.cursor
-	}
-	if m.offset+h <= m.cursor {
-		m.offset = m.cursor - h + 1
-	}
-	if m.offset < 0 {
-		m.offset = 0
-	}
+	m.expanded = next
+	m.rows = buildRowsWithQuery(m.results, query, m.expanded)
+	m.cursor = 0
+	m.offset = 0
+	m.clampView()
 }
 
 type statusMsg struct {
